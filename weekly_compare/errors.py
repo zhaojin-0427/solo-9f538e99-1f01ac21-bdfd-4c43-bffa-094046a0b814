@@ -43,10 +43,28 @@ class RevisionConflict(AppError):
     """A non-increasing revision tried to replace an already accepted report.
 
     This is how "只接受更高修订整日替换" is enforced: a day is only ever
-    replaced by a strictly higher revision, never edited in place.
+    replaced by a strictly higher revision, never edited in place.  The check
+    runs against *every* spelling of the same store (matched by Unicode
+    casefold), so resubmitting the same day under another casing cannot
+    bypass it.
     """
 
     code = "revision_conflict"
+    http_status = 409
+
+
+class StoreConflict(AppError):
+    """A legacy store has two effective reports for the same business date.
+
+    Old databases may carry reports that were stored under different spellings
+    before identity was based on Unicode casefold.  Such a store is frozen:
+    the conflicting day(s) cannot be repaired through a new import, so every
+    new submission for the store is rejected while the original data stays
+    untouched.  A comparison whose selected dates include the store is also
+    paused until the conflict is resolved.
+    """
+
+    code = "store_conflict"
     http_status = 409
 
 

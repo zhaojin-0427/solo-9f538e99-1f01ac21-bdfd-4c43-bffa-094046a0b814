@@ -2,7 +2,7 @@
 {% block content %}
   <div class="page-head">
     <h1>同店对比</h1>
-    <p class="hint">选择两个周一，按同一门店、同一星期、同一小时配对。只统计两周都报齐的营业小时；报齐但无小票的小时按 0 计。</p>
+    <p class="hint">选择两个周一，按同一门店（编码按 Unicode 大小写归一识别，多种写法只算一家）、同一星期、同一小时配对。只统计两周都报齐的营业小时；报齐但无小票的小时按 0 计。若某天同店存在多写法的重复日报，将提示冲突日期并暂停出表。</p>
   </div>
 
   <form class="card filter-form" method="get" action="{{ url_for('main.compare_page') }}">

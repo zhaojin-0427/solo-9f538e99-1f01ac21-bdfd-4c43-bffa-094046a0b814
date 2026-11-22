@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import db
-from .errors import ImportRejected, NotFound, RevisionConflict
+from .errors import ImportRejected, NotFound, RevisionConflict, StoreConflict
 from .receipts import parse_complete_hours, parse_receipts_csv
 
 _WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -19,6 +19,19 @@ _MAX_REVISION = 9_999_999
 # Total of the 报齐 hours for one day.  Receipt parsing already bounds each
 # hour's total; this bounds their sum so the INTEGER column can never overflow.
 MAX_TOTAL_CENTS = 2**63 - 1
+
+
+def store_code_key(code: str) -> str:
+    """Identity key for a store code.
+
+    Store identity is defined by Unicode ``casefold`` rather than SQLite's
+    ``COLLATE NOCASE`` (which only folds ASCII).  ``MÜN-01`` and ``mün-01``
+    therefore resolve to the same store, and so do every other Unicode case
+    variant (e.g. ``ß``/``ss``).  The original spelling is always preserved in
+    ``stores.code``; only lookups and grouping use this key.
+    """
+
+    return code.strip().casefold()
 
 
 def weekday_name(value: date) -> str:
@@ -144,10 +157,45 @@ def _report_from_row(row: sqlite3.Row) -> CurrentReport:
     )
 
 
+def _select_report_by_code(
+    conn: sqlite3.Connection, store_code: str, business_date: str
+) -> sqlite3.Row | None:
+    """Find one effective report for a store spelling on a day.
+
+    An exact spelling match wins (so a legacy database that keeps one report
+    per spelling still serves each spelling its own original row).  If there
+    is no exact row we fall back to the store's casefold group, ordered by the
+    canonical (lowest-id) spelling — this is what lets any spelling find the
+    store's report when the group's reports live on non-overlapping dates.
+    """
+
+    key = store_code_key(store_code)
+    row = conn.execute(
+        _REPORT_SELECT
+        + " WHERE s.code = ? COLLATE BINARY AND cr.business_date = ?",
+        (store_code.strip(), business_date),
+    ).fetchone()
+    if row is not None:
+        return row
+    return conn.execute(
+        _REPORT_SELECT
+        + " WHERE s.code_key = ? AND cr.business_date = ? ORDER BY s.id ASC LIMIT 1",
+        (key, business_date),
+    ).fetchone()
+
+
 def list_stores(database: str | Path) -> list[Store]:
+    """One row per logical store (casefold group), canonical spelling first."""
+
     conn = db.connect(database)
     try:
-        rows = conn.execute("SELECT id, code, name FROM stores ORDER BY code").fetchall()
+        rows = conn.execute(
+            """
+            SELECT id, code, name FROM stores
+            WHERE id IN (SELECT MIN(id) FROM stores GROUP BY code_key)
+            ORDER BY code
+            """
+        ).fetchall()
     finally:
         conn.close()
     return [Store(id=r["id"], code=r["code"], name=r["name"]) for r in rows]
@@ -171,10 +219,7 @@ def get_current_report(
 ) -> CurrentReport | None:
     conn = db.connect(database)
     try:
-        row = conn.execute(
-            _REPORT_SELECT + " WHERE s.code = ? COLLATE NOCASE AND cr.business_date = ?",
-            (store_code.strip(), business_date),
-        ).fetchone()
+        row = _select_report_by_code(conn, store_code, business_date)
     finally:
         conn.close()
     return _report_from_row(row) if row is not None else None
@@ -221,10 +266,7 @@ def get_report_with_hours(
     """
 
     with db.read_snapshot(database) as conn:
-        row = conn.execute(
-            _REPORT_SELECT + " WHERE s.code = ? COLLATE NOCASE AND cr.business_date = ?",
-            (store_code.strip(), business_date),
-        ).fetchone()
+        row = _select_report_by_code(conn, store_code, business_date)
         if row is None:
             return None
         report = _report_from_row(row)
@@ -258,6 +300,23 @@ class ImportResult:
     receipt_line_count: int
 
 
+def _frozen_store_error(
+    group_rows: list[sqlite3.Row], duplicate_dates: list[str]
+) -> StoreConflict:
+    """Build the rejection for a legacy store frozen by a same-day duplicate."""
+
+    codes = "、".join(row["code"] for row in group_rows)
+    return StoreConflict(
+        f"门店（{codes}）在 {'、'.join(duplicate_dates)} "
+        "存在多种编码写法的同日日报，该门店已被冻结："
+        "新的报送一律拒收，原有日报保持不变。",
+        details=[
+            "请联系数据管理员保留其中一份日报后再试；"
+            "同店对比在包含该门店日报的日期上也会暂停出表。"
+        ],
+    )
+
+
 def import_daily_report(
     database: str | Path,
     *,
@@ -271,14 +330,19 @@ def import_daily_report(
     """Validate and atomically replace one store-day's current report.
 
     1. Every input (CSV included) is validated before any transaction opens.
-    2. One ``BEGIN IMMEDIATE`` transaction inserts an immutable new version, its
+    2. One ``BEGIN IMMEDIATE`` transaction resolves the store through its
+       Unicode casefold key, enforces the revision rule against *every*
+       spelling of the same store, inserts an immutable new version, its
        per-hour summary and the raw receipt lines, then flips
        ``current_reports`` to the new version.
     3. Any error rolls the whole thing back: the old report, its hours and all
        comparison results stay exactly as they were.
 
     A correction is therefore a *new* revision — older receipt lines are never
-    read or rewritten.
+    read or rewritten.  Because ``BEGIN IMMEDIATE`` serialises writers, two
+    concurrent imports of the same store-day are judged against the same rule:
+    exactly one can win, and the loser's revision is rejected against the
+    winner's already-committed value.
     """
 
     code = validate_store_code(store_code)
@@ -293,38 +357,76 @@ def import_daily_report(
         raise ImportRejected("销售额合计超出允许范围。")
     receipt_count = len(parsed.lines)
     now = _now_iso()
+    key = store_code_key(code)
 
     with db.write_transaction(database) as conn:
-        store_row = conn.execute(
-            "SELECT id, code, name FROM stores WHERE code = ? COLLATE NOCASE",
-            (code,),
-        ).fetchone()
-        if store_row is None:
+        # Resolve the whole casefold group.  New stores have one row; legacy
+        # databases may hold several spellings of the same physical store.
+        group_rows = conn.execute(
+            "SELECT id, code, code_key, name FROM stores WHERE code_key = ? ORDER BY id",
+            (key,),
+        ).fetchall()
+
+        if not group_rows:
             if not name:
                 raise ImportRejected("首次导入该门店时请填写门店名称。")
             cursor = conn.execute(
-                "INSERT INTO stores (code, name, created_at) VALUES (?, ?, ?)",
-                (code, name, now),
+                "INSERT INTO stores (code, code_key, name, created_at) VALUES (?, ?, ?, ?)",
+                (code, key, name, now),
             )
-            store = Store(id=cursor.lastrowid, code=code, name=name)
+            target_id = cursor.lastrowid
+            store = Store(id=target_id, code=code, name=name)
         else:
-            store = Store(id=store_row["id"], code=store_row["code"], name=store_row["name"])
-            if name and name != store_row["name"]:
-                conn.execute("UPDATE stores SET name = ? WHERE id = ?", (name, store.id))
-                store = Store(id=store.id, code=store.code, name=name)
+            # Same store under any spelling lands on the canonical (lowest-id)
+            # row, so a store never accumulates a second spelling going forward.
+            canonical = group_rows[0]
+            target_id = canonical["id"]
 
+            # Legacy conflict: two effective reports for one day under
+            # different spellings.  The store is frozen — reject every new
+            # submission and keep every original row untouched.
+            duplicates = conn.execute(
+                """
+                SELECT business_date, COUNT(*) AS n
+                FROM current_reports
+                WHERE store_id IN (
+                    SELECT id FROM stores WHERE code_key = ?
+                )
+                GROUP BY business_date
+                HAVING n > 1
+                ORDER BY business_date
+                """,
+                (key,),
+            ).fetchall()
+            if duplicates:
+                raise _frozen_store_error(
+                    group_rows, [row["business_date"] for row in duplicates]
+                )
+
+            store = Store(
+                id=target_id, code=canonical["code"], name=canonical["name"]
+            )
+            if name and name != canonical["name"]:
+                conn.execute("UPDATE stores SET name = ? WHERE id = ?", (name, target_id))
+                store = Store(id=target_id, code=store.code, name=name)
+
+        # Revision rule across the whole casefold group.  A normal group has a
+        # single store row, so this is the store-day's current revision; for a
+        # legacy multi-spelling group it is the highest effective revision of
+        # any spelling on that day.
         current = conn.execute(
             """
-            SELECT rv.revision
+            SELECT MAX(rv.revision) AS revision
             FROM current_reports cr
+            JOIN stores gs ON gs.id = cr.store_id
             JOIN report_versions rv ON rv.id = cr.report_version_id
-            WHERE cr.store_id = ? AND cr.business_date = ?
+            WHERE gs.code_key = ? AND cr.business_date = ?
             """,
-            (store.id, day_text),
+            (key, day_text),
         ).fetchone()
 
         replaced_revision = None
-        if current is not None:
+        if current is not None and current["revision"] is not None:
             current_revision = current["revision"]
             if revision_number <= current_revision:
                 raise RevisionConflict(
@@ -342,7 +444,7 @@ def import_daily_report(
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    store.id,
+                    target_id,
                     day_text,
                     revision_number,
                     len(hours),
@@ -377,7 +479,7 @@ def import_daily_report(
                 report_version_id = excluded.report_version_id,
                 updated_at = excluded.updated_at
             """,
-            (store.id, day_text, version_id, now),
+            (target_id, day_text, version_id, now),
         )
 
     return ImportResult(

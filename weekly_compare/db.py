@@ -11,6 +11,14 @@ Design notes
 * Comparison reads happen inside a single read transaction and are computed by
   one SQL statement.  Every store row and every total in a response therefore
   comes from one committed snapshot.
+
+Legacy databases
+----------------
+Store identity is based on ``stores.code_key`` (the Python Unicode
+``casefold`` of the submitted code, computed in application code).  Older
+databases only have ``stores.code``; :func:`migrate_schema` adds the column in
+place with ``ALTER TABLE`` and backfills it, so an existing database file keeps
+working without an export/import step.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS stores (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     code        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    code_key    TEXT NOT NULL DEFAULT '',
     name        TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
@@ -72,6 +81,48 @@ CREATE INDEX IF NOT EXISTS idx_current_reports_date
 """
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the current schema without losing data.
+
+    Every step is idempotent: fresh databases already match and the migration
+    becomes a no-op.  The ``code_key`` backfill deliberately leaves duplicates
+    in place — a legacy database that stored the same physical store under
+    several spellings keeps every original row; the conflict is handled by the
+    service layer (frozen store) rather than by collapsing data silently.
+
+    Several gunicorn workers can run this at the same instant: two of them may
+    pass the ``PRAGMA`` check before either has added the column, in which case
+    SQLite raises "duplicate column name" instead of a lock error.  That is the
+    expected race and is treated as success by re-reading the column list.
+    """
+
+    if not _has_column(conn, "stores", "code_key"):
+        try:
+            conn.execute(
+                "ALTER TABLE stores ADD COLUMN code_key TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            if not _has_column(conn, "stores", "code_key"):  # pragma: no cover
+                raise
+    # Backfill with Python's Unicode casefold (SQLite has no equivalent).
+    # Rows whose key is missing/blank get recomputed; existing values are kept
+    # so the migration is idempotent and never rewrites already-correct data.
+    rows = conn.execute("SELECT id, code FROM stores").fetchall()
+    conn.executemany(
+        "UPDATE stores SET code_key = ? WHERE id = ? AND (code_key = '' OR code_key IS NULL)",
+        [(row["code"].casefold(), row["id"]) for row in rows],
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stores_code_key ON stores (code_key)"
+    )
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open an autocommit connection with sane SQLite pragmas.
 
@@ -106,6 +157,9 @@ def init_db(path: str | Path) -> None:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(SCHEMA_SQL)
+            # Additive, idempotent migration for databases created by older
+            # versions of the application (adds/backfills stores.code_key).
+            migrate_schema(conn)
             return
         except sqlite3.OperationalError as exc:
             last_error = exc

@@ -2,16 +2,24 @@
 
 Business rules implemented here:
 
-* **Scope** — every store that has a current report on *either* Monday of the
-  comparison.  A store missing one side still appears (with ``—`` in the
-  missing column) so it cannot silently vanish from the report.
-* **Pairing** — a store's two reports are paired hour by hour.  An hour counts
+* **Store identity** — stores are grouped by their Unicode casefold key
+  (``stores.code_key``), so spellings such as ``MÜN-01`` and ``mün-01`` are
+  one store and the comparison lists exactly one row for it.
+* **Scope** — every casefold group that has a current report on *either*
+  Monday of the comparison.  A group missing one side still appears (with
+  ``—`` in the missing column) so it cannot silently vanish from the report.
+* **Pairing** — a group's two reports are paired hour by hour.  An hour counts
   only when it is 报齐 in **both** reports.
-* **Zero receipts** — hours are taken from ``report_hours``, which import writes
-  for every 报齐 hour (missing receipt rows contribute 0).  No receipt rescan.
-* **Consistency** — one SQL statement returns both the per-store rows and the
-  all-store total, executed inside one read snapshot, so the store figures and
-  the total are guaranteed to be from the same commit.
+* **Zero receipts** — hours are taken from ``report_hours``, which import
+  writes for every 报齐 hour (missing receipt rows contribute 0).  No receipt
+  rescan.
+* **Legacy conflicts** — a legacy database may hold two effective reports for
+  the same group and day under different spellings.  When such a group has any
+  report on either selected date, the conflicting dates are reported and the
+  comparison pauses instead of silently picking one spelling.
+* **Consistency** — one SQL statement returns both the per-store rows, the
+  all-store total and the conflict rows, executed inside one read snapshot, so
+  every figure in a response is guaranteed to be from the same commit.
 """
 
 from __future__ import annotations
@@ -20,74 +28,145 @@ from dataclasses import dataclass
 from datetime import date
 
 from . import db
-from .errors import ImportRejected
+from .errors import ImportRejected, StoreConflict
 from .services import parse_date, weekday_name
 
-# A single statement -> a single SQLite snapshot for rows *and* total.
-# Only report_hours is read: receipt_lines are never rescanned.
+# A single statement -> a single SQLite snapshot for rows, total *and*
+# conflicts.  Only report_hours is read: receipt_lines are never rescanned.
 _COMPARISON_SQL = """
 WITH a AS (
-    SELECT cr.store_id, rv.id AS version_id, rv.revision
+    SELECT s.code_key,
+           cr.store_id,
+           rv.id AS version_id,
+           rv.revision
     FROM current_reports cr
+    JOIN stores s ON s.id = cr.store_id
     JOIN report_versions rv ON rv.id = cr.report_version_id
     WHERE cr.business_date = :date_a
 ),
 b AS (
-    SELECT cr.store_id, rv.id AS version_id, rv.revision
+    SELECT s.code_key,
+           cr.store_id,
+           rv.id AS version_id,
+           rv.revision
     FROM current_reports cr
+    JOIN stores s ON s.id = cr.store_id
     JOIN report_versions rv ON rv.id = cr.report_version_id
     WHERE cr.business_date = :date_b
 ),
 scope AS (
-    SELECT store_id FROM a
+    SELECT code_key FROM a
     UNION
-    SELECT store_id FROM b
+    SELECT code_key FROM b
+),
+canonical AS (
+    -- One identity row per casefold group: the lowest-id spelling wins, so
+    -- the displayed code/name is stable for every group.
+    SELECT sc.id AS store_id, sc.code_key, sc.code AS store_code, sc.name AS store_name
+    FROM stores sc
+    WHERE sc.id IN (SELECT MIN(id) FROM stores GROUP BY code_key)
+),
+day_dupes AS (
+    -- Same-day duplicates across spellings, on the two selected dates only.
+    SELECT s.code_key, cr.business_date, COUNT(*) AS n
+    FROM current_reports cr
+    JOIN stores s ON s.id = cr.store_id
+    WHERE cr.business_date IN (:date_a, :date_b)
+    GROUP BY s.code_key, cr.business_date
+    HAVING COUNT(*) > 1
+),
+conflicts AS (
+    SELECT DISTINCT d.code_key
+    FROM day_dupes d
+    JOIN scope sc ON sc.code_key = d.code_key
+),
+conflict_rows AS (
+    SELECT 2 AS is_total,
+           c.store_id,
+           c.store_code,
+           c.store_name,
+           NULL AS revision_a,
+           NULL AS revision_b,
+           0 AS comparable_hours,
+           0 AS sales_a,
+           0 AS sales_b,
+           GROUP_CONCAT(d.business_date, '|') AS conflict_dates
+    FROM conflicts x
+    JOIN canonical c ON c.code_key = x.code_key
+    JOIN day_dupes d ON d.code_key = x.code_key
+    GROUP BY c.store_id, c.store_code, c.store_name
 ),
 matched AS (
-    SELECT a.store_id,
+    SELECT ga.code_key,
            ha.hour,
            ha.sales_cents AS sales_a,
            hb.sales_cents AS sales_b
-    FROM a
-    JOIN b ON b.store_id = a.store_id
-    JOIN report_hours ha ON ha.report_version_id = a.version_id
+    FROM a ga
+    JOIN b gb ON gb.code_key = ga.code_key
+    JOIN report_hours ha ON ha.report_version_id = ga.version_id
     JOIN report_hours hb
-      ON hb.report_version_id = b.version_id
+      ON hb.report_version_id = gb.version_id
      AND hb.hour = ha.hour
 ),
 per_store_matched AS (
-    SELECT store_id,
+    SELECT code_key,
            COUNT(*) AS comparable_hours,
            COALESCE(SUM(sales_a), 0) AS sales_a,
            COALESCE(SUM(sales_b), 0) AS sales_b
     FROM matched
-    GROUP BY store_id
+    GROUP BY code_key
+),
+-- At most one effective row per group per date for a non-conflicting group;
+-- pick deterministically so rev1/rev2 stay well-defined.
+a_one AS (
+    SELECT code_key, store_id, revision,
+           ROW_NUMBER() OVER (PARTITION BY code_key ORDER BY store_id) AS rn
+    FROM a
+),
+b_one AS (
+    SELECT code_key, store_id, revision,
+           ROW_NUMBER() OVER (PARTITION BY code_key ORDER BY store_id) AS rn
+    FROM b
 ),
 per_store AS (
-    SELECT s.id AS store_id,
-           s.code AS store_code,
-           s.name AS store_name,
-           a.revision AS revision_a,
-           b.revision AS revision_b,
+    SELECT c.store_id,
+           c.store_code,
+           c.store_name,
+           ao.revision AS revision_a,
+           bo.revision AS revision_b,
            COALESCE(pm.comparable_hours, 0) AS comparable_hours,
            COALESCE(pm.sales_a, 0) AS sales_a,
            COALESCE(pm.sales_b, 0) AS sales_b
-    FROM scope
-    JOIN stores s ON s.id = scope.store_id
-    LEFT JOIN a ON a.store_id = scope.store_id
-    LEFT JOIN b ON b.store_id = scope.store_id
-    LEFT JOIN per_store_matched pm ON pm.store_id = scope.store_id
+    FROM scope sc
+    JOIN canonical c ON c.code_key = sc.code_key
+    LEFT JOIN a_one ao ON ao.code_key = sc.code_key AND ao.rn = 1
+    LEFT JOIN b_one bo ON bo.code_key = sc.code_key AND bo.rn = 1
+    LEFT JOIN per_store_matched pm ON pm.code_key = sc.code_key
+    WHERE sc.code_key NOT IN (SELECT code_key FROM conflicts)
+),
+data_rows AS (
+    SELECT 0 AS is_total, store_id, store_code, store_name,
+           revision_a, revision_b, comparable_hours, sales_a, sales_b,
+           NULL AS conflict_dates
+    FROM per_store
+    UNION ALL
+    SELECT 1 AS is_total, NULL, NULL, '全店合计',
+           NULL, NULL,
+           COALESCE(SUM(comparable_hours), 0),
+           COALESCE(SUM(sales_a), 0),
+           COALESCE(SUM(sales_b), 0),
+           NULL
+    FROM per_store
 )
-SELECT 0 AS is_total, store_id, store_code, store_name,
-       revision_a, revision_b, comparable_hours, sales_a, sales_b
-FROM per_store
+SELECT is_total, store_id, store_code, store_name,
+       revision_a, revision_b, comparable_hours, sales_a, sales_b,
+       conflict_dates
+FROM data_rows
 UNION ALL
-SELECT 1 AS is_total, NULL, NULL, '全店合计',
-       NULL, NULL,
-       COALESCE(SUM(comparable_hours), 0),
-       COALESCE(SUM(sales_a), 0),
-       COALESCE(SUM(sales_b), 0)
-FROM per_store
+SELECT is_total, store_id, store_code, store_name,
+       revision_a, revision_b, comparable_hours, sales_a, sales_b,
+       conflict_dates
+FROM conflict_rows
 ORDER BY is_total ASC, store_code ASC
 """
 
@@ -169,8 +248,13 @@ def compare(database: str, date_a: str, date_b: str) -> Comparison:
 
     rows: list[ComparisonRow] = []
     total = ComparisonTotal(0, 0, 0)
+    conflicts: list[tuple[str, list[str]]] = []
     for row in result_rows:
-        if row["is_total"]:
+        if row["is_total"] == 2:
+            dates = sorted((row["conflict_dates"] or "").split("|")) if row["conflict_dates"] else []
+            conflicts.append((row["store_code"], dates))
+            continue
+        if row["is_total"] == 1:
             total = ComparisonTotal(
                 comparable_hours=row["comparable_hours"],
                 sales_a_cents=row["sales_a"],
@@ -188,6 +272,17 @@ def compare(database: str, date_a: str, date_b: str) -> Comparison:
                 sales_a_cents=row["sales_a"],
                 sales_b_cents=row["sales_b"],
             )
+        )
+
+    if conflicts:
+        details = [
+            f"门店 {code} 在 {('、'.join(dates))} 存在多种编码写法的同日日报。"
+            for code, dates in conflicts
+        ]
+        raise StoreConflict(
+            "所选日期中存在同店同日多份日报的冲突，已暂停出表；"
+            "请先处理冲突门店的重复日报后再对比。",
+            details=details,
         )
 
     return Comparison(
